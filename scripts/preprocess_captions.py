@@ -2,45 +2,40 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import List
-
-from tqdm import tqdm
-
 import sys
-from pathlib import Path
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.datasets.tokenizer import build_vocab_from_captions, save_vocab
-
-
-def load_coco_captions(captions_json: Path) -> List[str]:
-    payload = json.loads(captions_json.read_text(encoding="utf-8"))
-    captions = [ann["caption"] for ann in payload["annotations"]]
-    return captions
+from src.datasets.tokenizer import build_hf_tokenizer
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--captions-json", type=str, default="data/raw/coco2017/annotations/captions_train2017.json")
-    ap.add_argument("--out-vocab", type=str, default="data/processed/vocab.json")
-    ap.add_argument("--vocab-size", type=int, default=10000)
-    ap.add_argument("--min-freq", type=int, default=2)
+    ap.add_argument(
+        "--model-name",
+        type=str,
+        default="gpt2",
+        help="HF tokenizer name (e.g. gpt2, distilgpt2, bert-base-uncased).",
+    )
+    ap.add_argument(
+        "--out-tokenizer",
+        type=str,
+        default="data/processed/tokenizer",
+        help="Output directory for tokenizer.save_pretrained().",
+    )
+    ap.add_argument("--max-len", type=int, default=30)
     args = ap.parse_args()
 
-    captions_json = Path(args.captions_json)
-    out_vocab = Path(args.out_vocab)
+    out_dir = Path(args.out_tokenizer)
 
-    captions = load_coco_captions(captions_json)
-    vocab = build_vocab_from_captions(captions, vocab_size=args.vocab_size, min_freq=args.min_freq)
-    save_vocab(vocab, out_vocab)
+    tok = build_hf_tokenizer(model_name=args.model_name, max_len=args.max_len)
+    tok.save(out_dir)
 
-    print(f"Saved vocab to {out_vocab}")
-    print(f"Vocab size: {len(vocab.idx2word)}")
-    print("Special token ids:",
-          {"pad": vocab.pad_id, "bos": vocab.bos_id, "eos": vocab.eos_id, "unk": vocab.unk_id})
+    print(f"Saved HF tokenizer '{args.model_name}' to {out_dir}")
+    print("Tokenizer special IDs:",
+          {"pad": tok.pad_id, "bos": tok.bos_id, "eos": tok.eos_id})
 
 
 if __name__ == "__main__":
