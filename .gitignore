@@ -1,0 +1,4 @@
+# Ignore COCO raw data
+/data/raw/
+.venv/
+**/__pycache__/
