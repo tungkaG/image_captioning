@@ -1,125 +1,92 @@
 # src/datasets/tokenizer.py
 from __future__ import annotations
 
-import json
-import re
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Union
+
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
-_BASIC_TOKEN_RE = re.compile(r"[a-z0-9]+|[^\s]", re.IGNORECASE)
-
-# TODO: can replace with more robust tokenizer if desired (e.g. HuggingFace's tokenizers library), but this simple one is sufficient for COCO captions and keeps the vocab small.
-def basic_tokenize(text: str) -> List[str]:
+@dataclass
+class CaptionTokenizer:
     """
-    Simple tokenizer:
-    - lowercase
-    - split into alphanum chunks and punctuation tokens
+    Hugging Face tokenizer wrapper for captioning.
+    - Handles encode/decode
+    - Returns input_ids + attention_mask
+    - Supports saving/loading via save_pretrained/from_pretrained
     """
-    text = text.lower().strip()
-    return _BASIC_TOKEN_RE.findall(text)
-
-
-@dataclass(frozen=True)
-class Vocab:
-    word2idx: Dict[str, int]
-    idx2word: List[str]
-    pad_token: str = "<pad>"
-    bos_token: str = "<bos>"
-    eos_token: str = "<eos>"
-    unk_token: str = "<unk>"
+    tokenizer: PreTrainedTokenizerBase
+    max_len: int = 30
 
     @property
     def pad_id(self) -> int:
-        return self.word2idx[self.pad_token]
+        return int(self.tokenizer.pad_token_id)
 
     @property
-    def bos_id(self) -> int:
-        return self.word2idx[self.bos_token]
+    def bos_id(self) -> Optional[int]:
+        return None if self.tokenizer.bos_token_id is None else int(self.tokenizer.bos_token_id)
 
     @property
-    def eos_id(self) -> int:
-        return self.word2idx[self.eos_token]
+    def eos_id(self) -> Optional[int]:
+        return None if self.tokenizer.eos_token_id is None else int(self.tokenizer.eos_token_id)
 
-    @property
-    def unk_id(self) -> int:
-        return self.word2idx[self.unk_token]
+    def encode(self, caption: str, max_len: Optional[int] = None) -> Dict[str, List[int]]:
+        """
+        Returns dict with:
+          - input_ids: List[int]
+          - attention_mask: List[int]
+        """
+        max_len = max_len or self.max_len
+        out = self.tokenizer(
+            caption,
+            truncation=True,
+            padding="max_length",
+            max_length=max_len,
+            return_attention_mask=True,
+            add_special_tokens=True,
+        )
+        return {"input_ids": out["input_ids"], "attention_mask": out["attention_mask"]}
 
-    def encode(
-        self,
-        caption: str,
-        max_len: int = 30,
-        add_bos: bool = True,
-        add_eos: bool = True,
-    ) -> List[int]:
-        tokens = basic_tokenize(caption)
-        ids: List[int] = []
+    def batch_encode(self, captions: List[str], max_len: Optional[int] = None) -> Dict[str, List[List[int]]]:
+        max_len = max_len or self.max_len
+        out = self.tokenizer(
+            captions,
+            truncation=True,
+            padding="max_length",
+            max_length=max_len,
+            return_attention_mask=True,
+            add_special_tokens=True,
+        )
+        return {"input_ids": out["input_ids"], "attention_mask": out["attention_mask"]}
 
-        if add_bos:
-            ids.append(self.bos_id)
+    def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
+        return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens).strip()
 
-        for t in tokens:
-            ids.append(self.word2idx.get(t, self.unk_id))
+    def save(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.tokenizer.save_pretrained(str(path))
 
-        if add_eos:
-            ids.append(self.eos_id)
-
-        # Truncate (keep at least BOS and EOS if enabled)
-        if len(ids) > max_len:
-            ids = ids[:max_len]
-            # Ensure last token is EOS if add_eos
-            if add_eos:
-                ids[-1] = self.eos_id
-
-        return ids
-
-    def decode(self, ids: List[int], stop_at_eos: bool = True) -> str:
-        words = []
-        for i in ids:
-            w = self.idx2word[i] if 0 <= i < len(self.idx2word) else self.unk_token
-            if w == self.bos_token or w == self.pad_token:
-                continue
-            if stop_at_eos and w == self.eos_token:
-                break
-            words.append(w)
-        # light detokenization (keeps punctuation separated but readable)
-        return " ".join(words).replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?")
+    @classmethod
+    def load(cls, path: Union[str, Path], max_len: int = 30) -> "CaptionTokenizer":
+        tok = AutoTokenizer.from_pretrained(str(path), use_fast=True)
+        return cls(tokenizer=tok, max_len=max_len)
 
 
-def build_vocab_from_captions(
-    captions: List[str],
-    vocab_size: int = 10000,
-    min_freq: int = 2,
-) -> Vocab:
-    special = ["<pad>", "<bos>", "<eos>", "<unk>"]
-    counter: Counter[str] = Counter()
+def build_hf_tokenizer(
+    model_name: str = "gpt2",
+    max_len: int = 30,
+) -> CaptionTokenizer:
+    """
+    Recommended portfolio default: GPT-2 tokenizer (BPE).
+    For captioning, padding is needed; GPT-2 doesn't define pad_token by default.
+    We set pad_token = eos_token (common practice).
+    """
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-    for cap in captions:
-        counter.update(basic_tokenize(cap)) 
+    # Ensure we have a dedicated pad token (best practice for batching + loss masking)
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "<pad>"})
 
-    # Filter by min_freq
-    words = [w for w, f in counter.items() if f >= min_freq]
-    # Sort by frequency then alphabetically for determinism
-    words_sorted = sorted(words, key=lambda w: (-counter[w], w))
-    words_kept = words_sorted[: max(0, vocab_size - len(special))]
-
-    idx2word = special + words_kept
-    word2idx = {w: i for i, w in enumerate(idx2word)}
-    return Vocab(word2idx=word2idx, idx2word=idx2word)
-
-
-def save_vocab(vocab: Vocab, path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"idx2word": vocab.idx2word}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_vocab(path: str | Path) -> Vocab:
-    path = Path(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    idx2word = payload["idx2word"]
-    word2idx = {w: i for i, w in enumerate(idx2word)}
-    return Vocab(word2idx=word2idx, idx2word=idx2word)
+    return CaptionTokenizer(tokenizer=tok, max_len=max_len)

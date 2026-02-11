@@ -11,14 +11,14 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
-from .tokenizer import Vocab, load_vocab
+from .tokenizer import CaptionTokenizer  # <-- HF wrapper
 
 
 @dataclass(frozen=True)
 class CocoPaths:
     images_dir: Path           # e.g. data/raw/train2017
     captions_json: Path        # e.g. data/raw/annotations/captions_train2017.json
-    vocab_json: Path           # e.g. data/processed/vocab.json
+    vocab_json: Path           # NOW: directory like data/processed/tokenizer/
 
 
 def default_image_transform(image_size: int = 224) -> T.Compose:
@@ -35,6 +35,11 @@ class CocoCaptionDataset(Dataset):
     """
     Each item corresponds to one (image, caption) pair.
     COCO has multiple captions per image; we expand them as separate samples.
+
+    Tokenization:
+    - Uses Hugging Face tokenizer (subword/BPE/etc).
+    - Creates input_ids and target_ids by shifting (teacher forcing).
+    - attention_mask corresponds to input_ids (0 where pad).
     """
 
     def __init__(
@@ -50,12 +55,12 @@ class CocoCaptionDataset(Dataset):
         self.max_len = max_len
         self.transform = transform or default_image_transform()
 
-        self.vocab: Vocab = load_vocab(paths.vocab_json)
+        # Load HF tokenizer wrapper from directory (saved via save_pretrained)
+        self.tok: CaptionTokenizer = CaptionTokenizer.load(paths.vocab_json, max_len=max_len)
+        self.pad_id: int = self.tok.pad_id
 
         payload = json.loads(Path(paths.captions_json).read_text(encoding="utf-8"))
 
-        # images: [{id, file_name, ...}]
-        # annotations: [{image_id, caption, ...}]
         images_by_id = {img["id"]: img["file_name"] for img in payload["images"]}
 
         samples: List[Tuple[Path, str]] = []
@@ -84,28 +89,30 @@ class CocoCaptionDataset(Dataset):
             img = img.convert("RGB")
             image_tensor = self.transform(img)
 
-        # Encode caption
-        # We create input_ids (BOS ...), and target_ids (... EOS) by shifting
-        # This is the standard teacher-forcing format.
-        full_ids = self.vocab.encode(caption, max_len=self.max_len, add_bos=True, add_eos=True)
+        # Encode caption with HF tokenizer
+        enc = self.tok.encode(caption, max_len=self.max_len)
+        full_ids = enc["input_ids"]           # length = max_len
+        full_mask = enc["attention_mask"]     # length = max_len
 
-        # Ensure at least BOS + EOS
-        if len(full_ids) < 2:
-            full_ids = [self.vocab.bos_id, self.vocab.eos_id]
-
-        # Shift
+        # Teacher forcing shift: (BOS ... ) -> predict next token
+        # input_ids  = ids[:-1]
+        # target_ids = ids[1:]
         input_ids = torch.tensor(full_ids[:-1], dtype=torch.long)
-        target_ids = torch.tensor(full_ids[-1:], dtype=torch.long) if len(full_ids) == 1 else torch.tensor(full_ids[1:], dtype=torch.long)
+        target_ids = torch.tensor(full_ids[1:], dtype=torch.long)
 
-        # Length is number of non-pad tokens in input sequence
-        length = int(input_ids.numel())
+        # attention mask aligned with input_ids
+        attention_mask = torch.tensor(full_mask[:-1], dtype=torch.long)
+
+        # length = number of non-pad tokens in input sequence (== sum(attention_mask))
+        length = int(attention_mask.sum().item())
 
         return {
             "image": image_tensor,
             "input_ids": input_ids,
             "target_ids": target_ids,
+            "attention_mask": attention_mask,
             "length": length,
-            "pad_id": self.vocab.pad_id,
+            "pad_id": self.pad_id,
             "caption_raw": caption,
             "image_path": str(img_path),
         }
