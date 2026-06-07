@@ -27,6 +27,23 @@ from src.training.trainer import TrainConfig, Trainer
 from src.utils.seed import seed_everything
 
 
+def _load_resume_checkpoint(
+    resume_path: Path,
+    model: Captioner,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[int, int]:
+    ckpt = torch.load(resume_path, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+
+    optimizer_state = ckpt.get("optimizer")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+
+    start_epoch = int(ckpt.get("epoch", -1)) + 1
+    start_step = int(ckpt.get("step", 0))
+    return start_epoch, start_step
+
+
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--images-dir", type=str, default="data/raw/coco2017/train2017")
@@ -39,7 +56,12 @@ def _parse_args() -> argparse.Namespace:
 
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--max-len", type=int, default=30)
-    ap.add_argument("--limit", type=int, default=256, help="Limit samples for debugging/overfit.")
+    ap.add_argument("--limit", type=int, default=0, help="Limit samples for debugging/overfit; 0 uses the full dataset.")
+    ap.add_argument(
+        "--one-caption-per-image",
+        action="store_true",
+        help="Sample one caption per image each epoch to avoid repeated encoder passes.",
+    )
 
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -48,6 +70,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-dir", type=str, default="outputs/checkpoints")
+    ap.add_argument("--save-every-steps", type=int, default=0)
+    ap.add_argument("--resume-from", type=str, default="")
     ap.add_argument("--seed", type=int, default=1337)
 
     ap.add_argument("--encoder", type=str, default="resnet50", choices=["resnet18", "resnet34", "resnet50"])
@@ -82,7 +106,12 @@ def main() -> None:
         vocab_json=Path(args.tokenizer_dir),
     )
 
-    ds = CocoCaptionDataset(paths=paths, max_len=int(args.max_len), limit=int(args.limit) if args.limit else None)
+    ds = CocoCaptionDataset(
+        paths=paths,
+        max_len=int(args.max_len),
+        limit=int(args.limit) if args.limit else None,
+        one_caption_per_image=bool(args.one_caption_per_image),
+    )
     dl = DataLoader(
         ds,
         batch_size=int(args.batch_size),
@@ -122,11 +151,48 @@ def main() -> None:
         device=str(args.device),
         log_every=int(args.log_every),
         save_dir=str(args.save_dir),
+        save_every_steps=int(args.save_every_steps),
         overfit_batches=int(args.overfit_batches),
     )
 
-    trainer = Trainer(model=model, optimizer=optimizer, cfg=cfg, pad_id=int(tok.pad_id))
-    trainer.fit(dl)
+    checkpoint_extra = {
+        "model_config": {
+            "encoder": {
+                "name": str(args.encoder),
+                "pretrained": True,
+                "trainable": bool(args.encoder_trainable),
+                "proj_dim": int(args.proj_dim),
+            },
+            "decoder": {
+                "embed_dim": int(args.embed_dim),
+                "hidden_dim": int(args.hidden_dim),
+                "num_layers": int(args.num_layers),
+                "dropout": float(args.dropout),
+            },
+        },
+        "tokenizer_dir": str(Path(args.tokenizer_dir)),
+        "max_len": int(args.max_len),
+        "one_caption_per_image": bool(args.one_caption_per_image),
+    }
+
+    start_epoch = 0
+    start_step = 0
+    if args.resume_from:
+        start_epoch, start_step = _load_resume_checkpoint(
+            resume_path=Path(args.resume_from),
+            model=model,
+            optimizer=optimizer,
+        )
+        print(f"[OK] resumed from {args.resume_from} at epoch={start_epoch} step={start_step}")
+
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        cfg=cfg,
+        pad_id=int(tok.pad_id),
+        checkpoint_extra=checkpoint_extra,
+    )
+    trainer.fit(dl, start_epoch=start_epoch, start_step=start_step)
 
 
 if __name__ == "__main__":

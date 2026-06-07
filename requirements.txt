@@ -3,3 +3,7 @@ torchvision
 tqdm
 pycocotools
 Pillow
+transformers
+nltk
+numpy
+kagglehub

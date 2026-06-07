@@ -20,6 +20,7 @@ class TrainConfig:
 	device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
 	log_every: int = 20
 	save_dir: str = "outputs/checkpoints"
+	save_every_steps: int = 0
 	overfit_batches: int = 0  # if >0, repeat first N batches forever
 
 
@@ -41,6 +42,7 @@ class Trainer:
 		optimizer: torch.optim.Optimizer,
 		cfg: TrainConfig,
 		pad_id: int,
+		checkpoint_extra: Optional[dict] = None,
 		scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
 	) -> None:
 		self.model = model
@@ -48,16 +50,34 @@ class Trainer:
 		self.scheduler = scheduler
 		self.cfg = cfg
 		self.pad_id = int(pad_id)
+		self.checkpoint_extra = checkpoint_extra or {}
 		self.device = _resolve_device(cfg.device)
 		self.model.to(self.device)
 
-	def fit(self, train_loader: DataLoader) -> None:
+	def _checkpoint_payload(self, epoch: int, step: int) -> dict:
+		payload = {
+			"model": self.model.state_dict(),
+			"optimizer": self.optimizer.state_dict(),
+			"epoch": int(epoch),
+			"step": int(step),
+			"pad_id": self.pad_id,
+		}
+		if self.scheduler is not None:
+			payload["scheduler"] = self.scheduler.state_dict()
+		payload.update(self.checkpoint_extra)
+		return payload
+
+	def _save_checkpoint(self, path: Path, epoch: int, step: int) -> None:
+		torch.save(self._checkpoint_payload(epoch=epoch, step=step), path)
+		print(f"[OK] saved checkpoint: {path}")
+
+	def fit(self, train_loader: DataLoader, start_epoch: int = 0, start_step: int = 0) -> None:
 		self.model.train()
-		step = 0
+		step = int(start_step)
 		save_dir = Path(self.cfg.save_dir)
 		save_dir.mkdir(parents=True, exist_ok=True)
 
-		for epoch in range(int(self.cfg.epochs)):
+		for epoch in range(int(start_epoch), int(self.cfg.epochs)):
 			running = 0.0
 			seen = 0
 
@@ -91,6 +111,11 @@ class Trainer:
 					running = 0.0
 					seen = 0
 
+				if self.cfg.save_every_steps and step % int(self.cfg.save_every_steps) == 0:
+					latest_path = save_dir / "captioner_latest.pt"
+					self._save_checkpoint(latest_path, epoch=epoch, step=step)
+
 			ckpt_path = save_dir / f"captioner_epoch{epoch}.pt"
-			torch.save({"model": self.model.state_dict(), "epoch": epoch}, ckpt_path)
-			print(f"[OK] saved checkpoint: {ckpt_path}")
+			self._save_checkpoint(ckpt_path, epoch=epoch, step=step)
+			latest_path = save_dir / "captioner_latest.pt"
+			self._save_checkpoint(latest_path, epoch=epoch, step=step)
